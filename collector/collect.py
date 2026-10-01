@@ -158,6 +158,9 @@ class JsonStore:
             if r["id"] == did:
                 r.update(fields)
 
+    def delete(self, did, move_status_to=None):
+        self.rows = [r for r in self.rows if r["id"] != did]
+
     def meta(self, data):
         print("[meta]", json.dumps(data, ensure_ascii=False))
 
@@ -192,6 +195,17 @@ class FirestoreStore:
     def update(self, did, fields):
         self.db.collection("reviews").document(did).update(fields)
 
+    def delete(self, did, move_status_to=None):
+        if move_status_to:
+            src = self.db.collection("status").document(did)
+            snap = src.get()
+            dst = self.db.collection("status").document(move_status_to)
+            if snap.exists and not dst.get().exists:
+                dst.set(snap.to_dict())
+            if snap.exists:
+                src.delete()
+        self.db.collection("reviews").document(did).delete()
+
     def meta(self, data):
         self.db.collection("meta").document("lastRun").set(data, merge=True)
 
@@ -204,30 +218,73 @@ class FirestoreStore:
 
 
 # ---------------------------------------------------------------- 병합
+def body_key(r):
+    body = "".join(((r.get("title") or "") + (r.get("text") or "")).split())
+    return f"{r['app']}|{r['store']}|{body[:40]}"
+
+
+def days_apart(a, b):
+    try:
+        return abs((datetime.fromisoformat(a) - datetime.fromisoformat(b)).days)
+    except Exception:  # noqa: BLE001
+        return 99
+
+
+def same_review(a, b):
+    """본문이 같고, 작성일이 2일 이내이며, 작성자가 같거나 한쪽이 비어 있으면 같은 리뷰로 본다.
+    (Play 웹 화면과 수집기의 시간대 기준이 달라 날짜가 하루 어긋나는 경우가 있음)"""
+    if days_apart(a.get("date", ""), b.get("date", "")) > 2:
+        return False
+    au, bu = (a.get("author") or "").strip(), (b.get("author") or "").strip()
+    return not au or not bu or au == bu
+
+
 def merge(store, incoming, seed=False):
     ex = store.existing()
-    sigs = {signature(r): did for did, r in ex.items()}
+    idx = {}
+    for did, r in ex.items():
+        idx.setdefault(body_key(r), []).append(did)
     added, upgraded, stamp = [], 0, today()
     for r in incoming:
         did = r.get("id") or doc_id(r["app"], r["store"], r["rid"])
         if did in ex:
             continue
-        s = signature(r)
-        if s in sigs:
+        match = next((m for m in idx.get(body_key(r), []) if same_review(ex[m], r)), None)
+        if match:
             # 같은 리뷰가 다른 경로로 이미 들어와 있으면 비어 있는 필드만 채움
-            old = ex[sigs[s]]
+            old = ex[match]
             fill = {k: r[k] for k in ("rating", "version", "author") if r.get(k) and not old.get(k)}
             if fill:
-                store.update(sigs[s], fill)
+                store.update(match, fill)
                 old.update(fill)
                 upgraded += 1
             continue
         doc = dict(r, id=did, collectedAt=r.get("collectedAt") or stamp, seed=bool(seed or r.get("seed")))
         added.append(doc)
         ex[did] = doc
-        sigs[s] = did
+        idx.setdefault(body_key(doc), []).append(did)
     store.add(added)
     return added, upgraded
+
+
+def dedupe(store):
+    """이미 저장된 중복 정리: 같은 리뷰가 두 번 있으면 브라우저로 모은 사본(seed)을 지우고
+    스토어에서 직접 받은 쪽을 남긴다. 사본에 남긴 확인 상태는 남는 쪽으로 옮긴다."""
+    ex = store.existing()
+    groups = {}
+    for did, r in ex.items():
+        groups.setdefault(body_key(r), []).append(did)
+    removed = 0
+    for ids in groups.values():
+        if len(ids) < 2:
+            continue
+        real = [i for i in ids if not ex[i].get("seed")]
+        for sid in [i for i in ids if ex[i].get("seed")]:
+            keep = next((k for k in real if same_review(ex[k], ex[sid])), None)
+            if keep:
+                store.delete(sid, move_status_to=keep)
+                removed += 1
+    return removed
 
 
 def main():
@@ -250,10 +307,13 @@ def main():
         if a.seed:
             seed_added, _ = merge(store, json.load(open(a.seed, encoding="utf-8")), seed=True)
             print(f"기존 데이터 반영: {len(seed_added)}건")
-        added, counts, errors, upgraded = [], {}, [], 0
+        added, counts, errors, upgraded, removed = [], {}, [], 0, 0
         if not a.no_fetch:
             fetched, counts, errors = fetch_all()
             added, upgraded = merge(store, fetched)
+        removed = dedupe(store)
+        if removed:
+            print(f"중복 정리: {removed}건")
         by = {}
         for d in added:
             k = f"{d['app']}_{d['store']}"
@@ -262,7 +322,7 @@ def main():
         store.meta({"status": "done", "startedAt": started,
                     "finishedAt": datetime.now(KST).isoformat(timespec="seconds"),
                     "date": today(), "added": len(added), "addedBy": by, "fetched": counts,
-                    "failed": failed, "upgraded": upgraded, "errors": errors[:5], "trigger": a.trigger})
+                    "failed": failed, "upgraded": upgraded, "deduped": removed if not a.no_fetch else 0, "errors": errors[:5], "trigger": a.trigger})
         print(f"신규 {len(added)}건 {by} / 보강 {upgraded}건 / 조회 실패 {failed}")
     except Exception as e:
         store.meta({"status": "error", "finishedAt": datetime.now(KST).isoformat(timespec="seconds"),
