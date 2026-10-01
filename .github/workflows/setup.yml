@@ -1,0 +1,26 @@
+name: 최초 설정 (1회)
+
+on:
+  workflow_dispatch:
+    inputs:
+      admins:
+        description: "관리자 Google 이메일 (여러 명이면 쉼표로 구분)"
+        required: true
+
+jobs:
+  setup:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      TZ: UTC
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -r collector/requirements.txt
+      - name: 관리자 등록 + 기존 리뷰 반영 + 첫 수집
+        env:
+          FIREBASE_SERVICE_ACCOUNT: ${{ secrets.FIREBASE_SERVICE_ACCOUNT }}
+          TRIGGER: setup
+        run: python collector/collect.py --seed seed/reviews_seed.json --admins "${{ inputs.admins }}"
