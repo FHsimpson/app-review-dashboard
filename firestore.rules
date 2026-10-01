@@ -1,0 +1,39 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    function members() {
+      return get(/databases/$(database)/documents/config/members).data;
+    }
+    function email() {
+      return request.auth.token.email.lower();
+    }
+    function isMember() {
+      return request.auth != null
+        && request.auth.token.email_verified == true
+        && email() in members().emails;
+    }
+    function isAdmin() {
+      return isMember() && email() in members().admins;
+    }
+    function validStatus() {
+      let d = request.resource.data;
+      return d.keys().hasOnly(['state', 'memo', 'by', 'byName', 'at'])
+        && d.state in ['todo', 'checking', 'done', 'na']
+        && d.by == email()
+        && (!('memo' in d) || (d.memo is string && d.memo.size() <= 1000));
+    }
+
+    // 리뷰·수집 기록: 수집기(서비스 계정)만 쓰고, 팀원은 읽기만
+    match /reviews/{id}  { allow read: if isMember(); allow write: if false; }
+    match /meta/{id}     { allow read: if isMember(); allow write: if false; }
+
+    // 확인 상태: 팀원 누구나 변경 가능 (변경한 사람이 자동 기록됨)
+    match /status/{id}      { allow read: if isMember(); allow create, update: if isMember() && validStatus(); allow delete: if isMember(); }
+    match /issueStatus/{id} { allow read: if isMember(); allow create, update: if isMember() && validStatus(); allow delete: if isMember(); }
+
+    // 팀원 목록·GitHub 토큰: 관리자만 변경
+    match /config/members { allow read: if isMember(); allow write: if isAdmin(); }
+    match /config/github  { allow read: if isMember(); allow write: if isAdmin(); }
+  }
+}
